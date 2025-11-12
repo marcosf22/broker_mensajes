@@ -466,12 +466,30 @@ def borrar_cola(nombre_cola):
 # -----------------------------------------------
 # --- Arranque del Servidor ---
 # -----------------------------------------------
+
 if __name__ == '__main__':
-    # Cargar estado desde JSON ANTES de arrancar
+    # 1. Cargar estado desde JSON
     load_state_from_json()
     
+    # 2. Iniciar el hilo de limpieza
     hilo_limpieza = threading.Thread(target=limpiar_y_reencolar, daemon=True)
     hilo_limpieza.start()
     
+    # 3. (NUEVA SOLUCIÓN)
+    # Intentar entregar todos los mensajes re-encolados al arrancar.
+    
+    print("Broker: Realizando intento de entrega inicial tras reinicio...")
+    # Adquirir lock para obtener la lista de colas de forma segura
+    with g_lock: 
+        colas_a_revisar = list(g_colas.keys())
+        
+    # Llamar a intentar_entrega FUERA del lock principal,
+    # ya que la propia función intentar_entrega adquiere el lock.
+    for nombre_cola in colas_a_revisar:
+        print(f"Broker: Re-intentando entrega para cola '{nombre_cola}'...")
+        intentar_entrega(nombre_cola)
+    
+    # 4. Iniciar el servidor web
     print(f"Broker iniciado en http://localhost:5000 (DB: {JSON_DB_FILE})")
-    app.run(port=5000, debug=True, use_reloader=False)
+    # (Recuerda añadir host='0.0.0.0' si lo usas en red)
+    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)

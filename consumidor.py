@@ -2,7 +2,7 @@ import requests, threading, time, random
 from flask import Flask, request, jsonify
 
 # --- Configuración del Consumidor ---
-BROKER_URL = "http://localhost:5000"
+BROKER_URL = "http://10.1.66.41:5000"
 
 MI_PUERTO = 5001
 MI_URL_CALLBACK = f"http://localhost:{MI_PUERTO}/callback"
