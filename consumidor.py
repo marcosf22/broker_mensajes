@@ -1,14 +1,8 @@
-# consumidor.py
-
-import requests
+import requests, threading, time, random
 from flask import Flask, request, jsonify
-import threading
-import time
-import random
 
 # --- Configuración del Consumidor ---
 BROKER_URL = "http://localhost:5000"
-COLA_NOMBRE = "cola_de_prueba" # Debe coincidir con el productor
 
 MI_PUERTO = 5001
 MI_URL_CALLBACK = f"http://localhost:{MI_PUERTO}/callback"
@@ -18,7 +12,7 @@ MI_URL_CALLBACK = f"http://localhost:{MI_PUERTO}/callback"
 app_consumidor = Flask(__name__)
 
 def procesar_mensaje_y_enviar_ack(message_id, mensaje):
-    # (Sin cambios... sigue procesando y enviando ACK)
+    """Simula el procesamiento del mensaje y envía el ACK al broker."""
     try:
         print(f"CONSUMIDOR ({MI_PUERTO}): --> RECIBIDO: '{mensaje}' (ID: {message_id}). Procesando...")
         time.sleep(2)
@@ -30,7 +24,7 @@ def procesar_mensaje_y_enviar_ack(message_id, mensaje):
         print(f"CONSUMIDOR ({MI_PUERTO}): <-- Procesado OK. Enviando ACK para {message_id}.")
         requests.post(
             f"{BROKER_URL}/ack",
-            json={"message_id": message_id, "nombre_cola": COLA_NOMBRE},
+            json={"message_id": message_id, "nombre_cola": nombre_cola},
             timeout=2
         )
     except Exception as e:
@@ -57,35 +51,34 @@ def iniciar_servidor_consumidor():
     print(f"\nConsumidor: Escuchando callbacks en {MI_URL_CALLBACK}")
     app_consumidor.run(port=MI_PUERTO)
 
-# --- Parte Cliente (MODIFICADA) ---
 def suscribirse_al_broker():
-    # 1. Declarar la cola (MODIFICADO: durable=True)
+    # Declarar la cola
     try:
         requests.post(
             f"{BROKER_URL}/declarar_cola", 
-            json={"nombre": COLA_NOMBRE, "durable": True} # <-- NUEVO
+            json={"nombre": nombre_cola, "durable": True} # <-- NUEVO
         )
-        print(f"Consumidor: Cola '{COLA_NOMBRE}' declarada (Durable: True).")
+        print(f"Consumidor: Cola '{nombre_cola}' declarada (Durable: True).")
     except requests.exceptions.RequestException as e:
         print(f"Consumidor: No se pudo conectar al broker para declarar: {e}")
         return
 
-    # 2. Suscribirse (sin cambios)
+    # Suscribirse (sin cambios)
     try:
         r = requests.post(
             f"{BROKER_URL}/consumir", 
-            json={"nombre": COLA_NOMBRE, "callback_url": MI_URL_CALLBACK}
+            json={"nombre": nombre_cola, "callback_url": MI_URL_CALLBACK}
         )
         r.raise_for_status()
-        print(f"Consumidor: Suscrito a '{COLA_NOMBRE}' con callback {MI_URL_CALLBACK}")
+        print(f"Consumidor: Suscrito a '{nombre_cola}' con callback {MI_URL_CALLBACK}")
     except requests.exceptions.RequestException as e:
         print(f"Consumidor: Error al suscribirse: {e}")
 
-# --- Arranque (sin cambios) ---
 if __name__ == '__main__':
     servidor_thread = threading.Thread(target=iniciar_servidor_consumidor, daemon=True)
     servidor_thread.start()
     time.sleep(1) 
+    nombre_cola = input("Consumidor: Introduce el nombre de la cola a consumir: ").strip()
     suscribirse_al_broker()
     print("Consumidor iniciado. Presiona CTRL+C para parar.")
     try:
