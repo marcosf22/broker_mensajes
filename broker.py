@@ -17,15 +17,12 @@ JSON_DB_FILE = "broker.db.json"
 
 # --- Estructura de Datos (Estado del Broker) ---
 g_colas = {} # Se carga desde el JSON al inicio
-g_lock = threading.Lock() # <-- ESTE LOCK ES CRÍTICO
-# g_lock AHORA PROTEGE TANTO g_colas (RAM) COMO la escritura en JSON_DB_FILE
-# Esto asegura que la RAM y el Disco nunca estén desincronizados.
-
+g_lock = threading.Lock() 
 ACK_TIMEOUT_SEC = 30
 PREFETCH_COUNT = 1
 
 # -----------------------------------------------
-# --- (CORREGIDO) Helpers de Serialización JSON ---
+# --- Helpers de Serialización JSON ---
 # -----------------------------------------------
 
 def _state_to_json_serializable(state_dict):
@@ -40,12 +37,11 @@ def _state_to_json_serializable(state_dict):
         serializable_mensajes = []
         for msg_obj in queue_data["mensajes"]:
             serializable_msg = msg_obj.copy()
-            # Convertir su timestamp a string
             serializable_msg["timestamp"] = msg_obj["timestamp"].isoformat()
             serializable_mensajes.append(serializable_msg)
 
         serializable_state[queue_name] = {
-            "mensajes": serializable_mensajes, # <-- ARREGLADO
+            "mensajes": serializable_mensajes, 
             "consumidores": queue_data["consumidores"], 
             "indice_rr": queue_data["indice_rr"],
             "durable": queue_data.get("durable", False),
@@ -55,14 +51,12 @@ def _state_to_json_serializable(state_dict):
         # 2. Convertir mensajes anidados en 'unacked'
         for msg_id, unacked_data in queue_data["unacked"].items():
             
-            # Convertir el mensaje_obj anidado
             msg_obj = unacked_data["mensaje_obj"]
             serializable_msg_obj = msg_obj.copy()
-            # Convertir su timestamp a string
             serializable_msg_obj["timestamp"] = msg_obj["timestamp"].isoformat()
             
             serializable_state[queue_name]["unacked"][msg_id] = {
-                "mensaje_obj": serializable_msg_obj, # <-- ARREGLADO
+                "mensaje_obj": serializable_msg_obj, 
                 "timestamp_envio": unacked_data["timestamp_envio"].isoformat(),
                 "consumer_url": unacked_data["consumer_url"]
             }
@@ -71,7 +65,7 @@ def _state_to_json_serializable(state_dict):
 
 def _json_to_state(json_data):
     """
-    Convierte el diccionario cargado de JSON de nuevo al formato
+    (CORREGIDO) Convierte el diccionario cargado de JSON de nuevo al formato
     que g_colas espera (con deques y datetimes).
     """
     state = {}
@@ -87,18 +81,22 @@ def _json_to_state(json_data):
                 "payload": msg_obj_raw["payload"],
                 "timestamp": datetime.fromisoformat(msg_obj_raw["timestamp"])
             })
+        
+        # 2. (CORREGIDO) Convertir 'consumidores' y FORZAR unacked_count a 0
+        consumidores_con_reset = {}
+        for url, data in queue_data.get("consumidores", {}).items():
+            # FORZAR el reseteo del contador al cargar
+            consumidores_con_reset[url] = {"unacked_count": 0} 
 
         state[queue_name] = {
-            "mensajes": mensajes_con_datetime, # <-- ARREGLADO
-            "consumidores": queue_data["consumidores"], 
+            "mensajes": mensajes_con_datetime, 
+            "consumidores": consumidores_con_reset, # <-- Usar la lista reseteada
             "indice_rr": queue_data["indice_rr"],
             "durable": queue_data["durable"],
-            "unacked": {} 
+            "unacked": {} # Iniciar siempre vacío
         }
         
-        # 2. Convertir 'unacked' (de string a datetime)
-        consumidores_con_unacked = {} # Para reconstruir contadores
-        
+        # 3. (CORREGIDO) Re-encolar 'unacked' viejos (no reconstruirlos)
         for msg_id, unacked_data in queue_data.get("unacked", {}).items():
             msg_obj_raw = unacked_data["mensaje_obj"]
             mensaje_obj = {
@@ -106,32 +104,10 @@ def _json_to_state(json_data):
                 "payload": msg_obj_raw["payload"],
                 "timestamp": datetime.fromisoformat(msg_obj_raw["timestamp"])
             }
-            
-            state[queue_name]["unacked"][msg_id] = {
-                "mensaje_obj": mensaje_obj, # <-- ARREGLADO
-                "timestamp_envio": datetime.fromisoformat(unacked_data["timestamp_envio"]),
-                "consumer_url": unacked_data["consumer_url"]
-            }
-            
-            # Reconstruir contador
-            consumer_url = unacked_data["consumer_url"]
-            if consumer_url not in consumidores_con_unacked:
-                consumidores_con_unacked[consumer_url] = 0
-            consumidores_con_unacked[consumer_url] += 1
-
-        # Re-aplicar contadores reconstruidos
-        for url, count in consumidores_con_unacked.items():
-            if url not in state[queue_name]["consumidores"]:
-                 state[queue_name]["consumidores"][url] = {"unacked_count": 0}
-            state[queue_name]["consumidores"][url]["unacked_count"] = count
-
-        # Re-encolar mensajes 'unacked' (lógica de reinicio)
-        for msg_id, unacked_data in state[queue_name]["unacked"].items():
             print(f"Broker: Re-encolando mensaje 'unacked' {msg_id} de {queue_name} tras reinicio.")
-            state[queue_name]["mensajes"].appendleft(unacked_data["mensaje_obj"])
-        
-        state[queue_name]["unacked"] = {}
-            
+            # Añadir a la cola de mensajes, no a 'unacked'
+            state[queue_name]["mensajes"].appendleft(mensaje_obj)
+
     return state
 
 # -----------------------------------------------
@@ -145,17 +121,13 @@ def _save_state_to_json():
     obtener g_lock.
     """
     try:
-        # Convertir estado (deques, datetimes) a algo serializable
         serializable_state = _state_to_json_serializable(g_colas)
         
         tmp_file = JSON_DB_FILE + ".tmp"
         
-        # 1. Escribir en un archivo temporal
         with open(tmp_file, 'w') as f:
             json.dump(serializable_state, f, indent=4)
             
-        # 2. Renombrar el archivo temporal al archivo real
-        # Esta operación es atómica en la mayoría de SOs.
         os.replace(tmp_file, JSON_DB_FILE)
         
     except Exception as e:
@@ -171,7 +143,6 @@ def load_state_from_json():
             json_data = json.load(f)
         
         print(f"Broker: Cargando estado desde {JSON_DB_FILE}...")
-        # Convertir de JSON (listas, strings) al estado de RAM (deques, datetimes)
         g_colas = _json_to_state(json_data)
         print("Broker: Carga de estado completada.")
         
@@ -215,10 +186,9 @@ def intentar_entrega(nombre_cola):
         
         while cola["mensajes"] and cola["consumidores"]:
             
-            # --- Lógica de Fair Dispatch: Buscar consumidor libre ---
             consumidores_lista = list(cola["consumidores"].items())
             if not consumidores_lista:
-                break # No hay consumidores
+                break 
                 
             start_index = cola["indice_rr"] % len(consumidores_lista)
             
@@ -232,24 +202,19 @@ def intentar_entrega(nombre_cola):
                 if estado["unacked_count"] < PREFETCH_COUNT:
                     consumidor_disponible = (url, estado)
                     indice_encontrado = idx
-                    break # Encontramos uno
+                    break 
             
             if not consumidor_disponible:
                 print("Broker: Todos los consumidores están ocupados. Esperando...")
-                break # <-- CLAVE DEL FAIR DISPATCH
+                break 
             
-            # --- Fin de la búsqueda ---
-            
-            # 1. Actualizar el índice para la próxima búsqueda
             cola["indice_rr"] = (indice_encontrado + 1) % len(consumidores_lista)
             
-            # 2. Mover mensaje de "mensajes" a "unacked"
             url_callback, estado_consumidor = consumidor_disponible
             mensaje_obj = cola["mensajes"].popleft()
             
             timestamp_envio = datetime.now()
             
-            # 3. Actualizar RAM
             cola["unacked"][mensaje_obj["id"]] = {
                 "mensaje_obj": mensaje_obj,
                 "timestamp_envio": timestamp_envio,
@@ -258,18 +223,16 @@ def intentar_entrega(nombre_cola):
             estado_consumidor["unacked_count"] += 1
             
             if is_durable:
-                changes_made_to_durable = True # Marcar para guardado
+                changes_made_to_durable = True 
             
-            # 4. Enviar
             threading.Thread(
                 target=enviar_mensaje_callback, 
                 args=(url_callback, mensaje_obj)
             ).start()
             print(f"Broker: Mensaje {mensaje_obj['id']} asignado a {url_callback} (unacked: {estado_consumidor['unacked_count']})")
             
-        # 5. Guardar en JSON (solo si es necesario y está fuera del bucle)
         if changes_made_to_durable:
-            _save_state_to_json() # g_lock ya está adquirido
+            _save_state_to_json() 
 
 # -----------------------------------------------
 # --- Hilo de Limpieza ---
@@ -280,7 +243,7 @@ def limpiar_y_reencolar():
     Llama a _save_state_to_json si hay cambios.
     """
     while True:
-        time.sleep(10) # Revisar cada 10 seg
+        time.sleep(10)
         
         ahora = datetime.now()
         colas_con_novedades = set()
@@ -312,23 +275,20 @@ def limpiar_y_reencolar():
                         
                         print(f"Broker: TIMEOUT en ACK para {msg_id}. Re-encolando.")
                         
-                        # Actualizar RAM
                         cola["mensajes"].appendleft(mensaje_obj)
                         if consumer_url in cola["consumidores"]:
                             cola["consumidores"][consumer_url]["unacked_count"] -= 1
                         
-                        del cola["unacked"][msg_id] # Borrar de unacked
+                        del cola["unacked"][msg_id] 
                         
                         if is_durable:
                             changes_made_to_durable = True
                         
                         colas_con_novedades.add(nombre_cola)
             
-            # Guardar en JSON (solo si hubo cambios)
             if changes_made_to_durable:
-                _save_state_to_json() # g_lock ya está adquirido
+                _save_state_to_json() 
 
-        # --- Fuera del Lock, intentamos entregar ---
         for nombre_cola in colas_con_novedades:
             intentar_entrega(nombre_cola)
 
@@ -350,7 +310,6 @@ def declarar_cola():
         
     with g_lock:
         if nombre_cola not in g_colas:
-            # 1. Actualizar RAM
             g_colas[nombre_cola] = {
                 "mensajes": deque(),
                 "consumidores": {},
@@ -358,9 +317,8 @@ def declarar_cola():
                 "unacked": {},
                 "durable": durable
             }
-            # 2. Actualizar JSON
             if durable:
-                _save_state_to_json() # g_lock ya está adquirido
+                _save_state_to_json() 
             print(f"Broker: Cola '{nombre_cola}' (Durable: {durable}) creada.")
         else:
             print(f"Broker: Cola '{nombre_cola}' ya existe (idempotente).")
@@ -390,22 +348,17 @@ def publicar():
         cola = g_colas[nombre_cola]
         is_queue_durable = cola.get("durable", False)
         
-        # Creamos el objeto mensaje para RAM (con datetime)
         mensaje_obj_ram = {
             "id": str(uuid.uuid4()),
             "payload": mensaje,
-            "timestamp": datetime.now() # <-- Objeto datetime para RAM
+            "timestamp": datetime.now() 
         }
         
-        # 1. Actualizar RAM
         cola["mensajes"].append(mensaje_obj_ram)
         
-        # 2. Actualizar JSON
         is_msg_durable = durable and is_queue_durable
         if is_msg_durable:
-            # _save_state_to_json() se encargará de convertir
-            # el datetime a string al guardar.
-            _save_state_to_json() # g_lock ya está adquirido
+            _save_state_to_json() 
 
         print(f"Broker: Mensaje {mensaje_obj_ram['id']} (Durable: {is_msg_durable}) recibido para '{nombre_cola}'")
     
@@ -414,7 +367,6 @@ def publicar():
 
 @app.route('/consumir', methods=['POST'])
 def consumir():
-    # (Sin cambios de lógica)
     data = request.json
     nombre_cola = data.get('nombre')
     url_callback = data.get('callback_url')
@@ -455,7 +407,6 @@ def ack_mensaje():
             cola = g_colas[nombre_cola]
             is_durable = cola.get("durable", False)
             
-            # 1. Actualizar RAM
             mensaje_ackeado = cola["unacked"].pop(message_id, None)
             
             if mensaje_ackeado:
@@ -472,13 +423,10 @@ def ack_mensaje():
             else:
                 print(f"Broker: ACK recibido para {message_id} (pero no estaba en 'unacked').")
                 
-            # 2. Actualizar JSON
             if changes_made_to_durable:
-                _save_state_to_json() # g_lock ya está adquirido
+                _save_state_to_json() 
                 
     if ack_exitoso:
-        # Como este consumidor acaba de quedar libre,
-        # intentamos entregarle un nuevo mensaje INMEDIATAMENTE.
         intentar_entrega(nombre_cola)
         return jsonify({"status": "ack recibido"}), 200
     else:
@@ -503,13 +451,11 @@ def borrar_cola(nombre_cola):
     print(f"Admin: Solicitud de borrado para cola: '{nombre_cola}'")
     
     with g_lock:
-        # 1. Borrar de RAM
         cola_eliminada = g_colas.pop(nombre_cola, None)
     
         if cola_eliminada:
-            # 2. Borrar de JSON (guardando el nuevo estado sin la cola)
             if cola_eliminada.get("durable", False):
-                _save_state_to_json() # g_lock ya está adquirido
+                _save_state_to_json() 
             
             print(f"Admin: Cola '{nombre_cola}' eliminada exitosamente.")
             return jsonify({"status": "cola eliminada", "cola": nombre_cola}), 200
