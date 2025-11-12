@@ -3,7 +3,8 @@
 import threading
 import time
 import uuid
-import sqlite3 # <-- NUEVO
+import json 
+import os   
 from datetime import datetime, timedelta
 from collections import deque
 from flask import Flask, request, jsonify
@@ -11,116 +12,184 @@ import requests
 
 app = Flask(__name__)
 
-# --- Configuración de la Base de Datos ---
-DB_NAME = "broker.db"
-
-def get_db_conn():
-    """Crea una nueva conexión a la DB."""
-    conn = sqlite3.connect(DB_NAME, check_same_thread=False) # check_same_thread=False es necesario
-    conn.row_factory = sqlite3.Row # Para acceder a columnas por nombre
-    return conn
-
-def init_db():
-    """
-    Crea las tablas de la DB si no existen al arrancar.
-    """
-    with get_db_conn() as conn:
-        cursor = conn.cursor()
-        
-        # Tabla para las colas
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS queues (
-            name TEXT PRIMARY KEY NOT NULL,
-            durable INTEGER NOT NULL DEFAULT 0
-        )
-        """)
-        
-        # Tabla para los mensajes
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id TEXT PRIMARY KEY NOT NULL,
-            queue_name TEXT NOT NULL,
-            payload TEXT NOT NULL,
-            timestamp DATETIME NOT NULL,
-            durable INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'queued', -- 'queued' o 'unacked'
-            unacked_by_consumer TEXT,
-            unacked_timestamp DATETIME,
-            FOREIGN KEY (queue_name) REFERENCES queues (name) ON DELETE CASCADE
-        )
-        """)
-        conn.commit()
-    print("Broker: Base de datos inicializada.")
-
-def load_state_from_db():
-    """
-    (NUEVO) Carga el estado duradero de la DB a la memoria (g_colas).
-    Se llama solo al arrancar el broker.
-    """
-    print("Broker: Cargando estado desde la base de datos...")
-    with get_db_conn() as conn:
-        cursor = conn.cursor()
-        
-        # 1. Cargar colas duraderas
-        cursor.execute("SELECT name FROM queues WHERE durable = 1")
-        for row in cursor.fetchall():
-            nombre_cola = row['name']
-            if nombre_cola not in g_colas:
-                g_colas[nombre_cola] = {
-                    "mensajes": deque(),
-                    "consumidores": {},
-                    "indice_rr": 0,
-                    "unacked": {},
-                    "durable": True # <-- Marcamos como duradera
-                }
-                print(f"Broker: Cola duradera '{nombre_cola}' recuperada.")
-
-        # 2. Cargar mensajes duraderos (los 'unacked' se re-encolan)
-        cursor.execute("SELECT * FROM messages WHERE durable = 1")
-        for row in cursor.fetchall():
-            nombre_cola = row['queue_name']
-            if nombre_cola in g_colas: # Solo si la cola es duradera
-                mensaje_obj = {
-                    "id": row['id'],
-                    "payload": row['payload'],
-                    "timestamp": datetime.fromisoformat(row['timestamp'])
-                }
-                
-                # (NUEVO) Reconstruir el estado 'unacked'
-                if row['status'] == 'unacked':
-                    consumer_url = row['unacked_by_consumer']
-                    unacked_data = {
-                        "mensaje_obj": mensaje_obj,
-                        "timestamp_envio": datetime.fromisoformat(row['unacked_timestamp']),
-                        "consumer_url": consumer_url
-                    }
-                    g_colas[nombre_cola]["unacked"][mensaje_obj["id"]] = unacked_data
-                    
-                    # (NUEVO) Reconstruir el contador del consumidor
-                    # Esto asume que el consumidor se volverá a suscribir.
-                    # Si no lo hace, el 'limpiar_y_reencolar' lo arreglará.
-                    if consumer_url not in g_colas[nombre_cola]["consumidores"]:
-                         g_colas[nombre_cola]["consumidores"][consumer_url] = {"unacked_count": 0}
-                    g_colas[nombre_cola]["consumidores"][consumer_url]["unacked_count"] += 1
-                    
-                    print(f"Broker: Mensaje 'unacked' {mensaje_obj['id']} recuperado para {nombre_cola}")
-                else:
-                    g_colas[nombre_cola]["mensajes"].append(mensaje_obj)
-                    print(f"Broker: Mensaje 'queued' {mensaje_obj['id']} recuperado para {nombre_cola}")
-            
-    print("Broker: Carga de estado completada.")
-
+# --- Configuración de la Base de Datos JSON ---
+JSON_DB_FILE = "broker.db.json"
 
 # --- Estructura de Datos (Estado del Broker) ---
-g_colas = {} # Ahora se rellena desde la DB al inicio
-g_lock = threading.Lock()
+g_colas = {} # Se carga desde el JSON al inicio
+g_lock = threading.Lock() # <-- ESTE LOCK ES CRÍTICO
+# g_lock AHORA PROTEGE TANTO g_colas (RAM) COMO la escritura en JSON_DB_FILE
+# Esto asegura que la RAM y el Disco nunca estén desincronizados.
+
 ACK_TIMEOUT_SEC = 30
 PREFETCH_COUNT = 1
 
-# --- Lógica de Entrega (MODIFICADA) ---
+# -----------------------------------------------
+# --- (CORREGIDO) Helpers de Serialización JSON ---
+# -----------------------------------------------
+
+def _state_to_json_serializable(state_dict):
+    """
+    Convierte el estado de g_colas (con deques y datetimes)
+    a un diccionario que json.dump puede manejar (con listas y strings ISO).
+    """
+    serializable_state = {}
+    for queue_name, queue_data in state_dict.items():
+        
+        # 1. Convertir mensajes en la cola 'mensajes'
+        serializable_mensajes = []
+        for msg_obj in queue_data["mensajes"]:
+            serializable_msg = msg_obj.copy()
+            # Convertir su timestamp a string
+            serializable_msg["timestamp"] = msg_obj["timestamp"].isoformat()
+            serializable_mensajes.append(serializable_msg)
+
+        serializable_state[queue_name] = {
+            "mensajes": serializable_mensajes, # <-- ARREGLADO
+            "consumidores": queue_data["consumidores"], 
+            "indice_rr": queue_data["indice_rr"],
+            "durable": queue_data.get("durable", False),
+            "unacked": {} 
+        }
+        
+        # 2. Convertir mensajes anidados en 'unacked'
+        for msg_id, unacked_data in queue_data["unacked"].items():
+            
+            # Convertir el mensaje_obj anidado
+            msg_obj = unacked_data["mensaje_obj"]
+            serializable_msg_obj = msg_obj.copy()
+            # Convertir su timestamp a string
+            serializable_msg_obj["timestamp"] = msg_obj["timestamp"].isoformat()
+            
+            serializable_state[queue_name]["unacked"][msg_id] = {
+                "mensaje_obj": serializable_msg_obj, # <-- ARREGLADO
+                "timestamp_envio": unacked_data["timestamp_envio"].isoformat(),
+                "consumer_url": unacked_data["consumer_url"]
+            }
+            
+    return serializable_state
+
+def _json_to_state(json_data):
+    """
+    Convierte el diccionario cargado de JSON de nuevo al formato
+    que g_colas espera (con deques y datetimes).
+    """
+    state = {}
+    for queue_name, queue_data in json_data.items():
+        if not queue_data.get("durable", False):
+            continue 
+
+        # 1. Convertir 'mensajes' (de string a datetime)
+        mensajes_con_datetime = deque()
+        for msg_obj_raw in queue_data["mensajes"]:
+            mensajes_con_datetime.append({
+                "id": msg_obj_raw["id"],
+                "payload": msg_obj_raw["payload"],
+                "timestamp": datetime.fromisoformat(msg_obj_raw["timestamp"])
+            })
+
+        state[queue_name] = {
+            "mensajes": mensajes_con_datetime, # <-- ARREGLADO
+            "consumidores": queue_data["consumidores"], 
+            "indice_rr": queue_data["indice_rr"],
+            "durable": queue_data["durable"],
+            "unacked": {} 
+        }
+        
+        # 2. Convertir 'unacked' (de string a datetime)
+        consumidores_con_unacked = {} # Para reconstruir contadores
+        
+        for msg_id, unacked_data in queue_data.get("unacked", {}).items():
+            msg_obj_raw = unacked_data["mensaje_obj"]
+            mensaje_obj = {
+                "id": msg_obj_raw["id"],
+                "payload": msg_obj_raw["payload"],
+                "timestamp": datetime.fromisoformat(msg_obj_raw["timestamp"])
+            }
+            
+            state[queue_name]["unacked"][msg_id] = {
+                "mensaje_obj": mensaje_obj, # <-- ARREGLADO
+                "timestamp_envio": datetime.fromisoformat(unacked_data["timestamp_envio"]),
+                "consumer_url": unacked_data["consumer_url"]
+            }
+            
+            # Reconstruir contador
+            consumer_url = unacked_data["consumer_url"]
+            if consumer_url not in consumidores_con_unacked:
+                consumidores_con_unacked[consumer_url] = 0
+            consumidores_con_unacked[consumer_url] += 1
+
+        # Re-aplicar contadores reconstruidos
+        for url, count in consumidores_con_unacked.items():
+            if url not in state[queue_name]["consumidores"]:
+                 state[queue_name]["consumidores"][url] = {"unacked_count": 0}
+            state[queue_name]["consumidores"][url]["unacked_count"] = count
+
+        # Re-encolar mensajes 'unacked' (lógica de reinicio)
+        for msg_id, unacked_data in state[queue_name]["unacked"].items():
+            print(f"Broker: Re-encolando mensaje 'unacked' {msg_id} de {queue_name} tras reinicio.")
+            state[queue_name]["mensajes"].appendleft(unacked_data["mensaje_obj"])
+        
+        state[queue_name]["unacked"] = {}
+            
+    return state
+
+# -----------------------------------------------
+# --- Funciones de Carga/Guardado de DB ---
+# -----------------------------------------------
+
+def _save_state_to_json():
+    """
+    Guarda el estado de g_colas en el archivo JSON de forma atómica.
+    IMPORTANTE: Esta función DEBE ser llamada DESPUÉS de
+    obtener g_lock.
+    """
+    try:
+        # Convertir estado (deques, datetimes) a algo serializable
+        serializable_state = _state_to_json_serializable(g_colas)
+        
+        tmp_file = JSON_DB_FILE + ".tmp"
+        
+        # 1. Escribir en un archivo temporal
+        with open(tmp_file, 'w') as f:
+            json.dump(serializable_state, f, indent=4)
+            
+        # 2. Renombrar el archivo temporal al archivo real
+        # Esta operación es atómica en la mayoría de SOs.
+        os.replace(tmp_file, JSON_DB_FILE)
+        
+    except Exception as e:
+        print(f"Broker: ¡¡ERROR CRÍTICO AL GUARDAR ESTADO!! {e}")
+
+def load_state_from_json():
+    """
+    Carga el estado desde el archivo JSON al arrancar.
+    """
+    global g_colas # Asegurarnos de modificar la variable global
+    try:
+        with open(JSON_DB_FILE, 'r') as f:
+            json_data = json.load(f)
+        
+        print(f"Broker: Cargando estado desde {JSON_DB_FILE}...")
+        # Convertir de JSON (listas, strings) al estado de RAM (deques, datetimes)
+        g_colas = _json_to_state(json_data)
+        print("Broker: Carga de estado completada.")
+        
+    except FileNotFoundError:
+        print(f"Broker: No se encontró {JSON_DB_FILE}. Empezando con estado vacío.")
+        g_colas = {}
+    except Exception as e:
+        print(f"Broker: Error al cargar {JSON_DB_FILE}: {e}. Empezando con estado vacío.")
+        g_colas = {}
+
+# -----------------------------------------------
+# --- Lógica de Entrega ---
+# -----------------------------------------------
 
 def enviar_mensaje_callback(url_callback, mensaje_obj):
-    # (Sin cambios)
+    """
+    Función en hilo para enviar el mensaje Y SU ID al consumidor.
+    """
     try:
         requests.post(url_callback, json={
             "mensaje": mensaje_obj["payload"],
@@ -132,150 +201,149 @@ def enviar_mensaje_callback(url_callback, mensaje_obj):
 
 def intentar_entrega(nombre_cola):
     """
-    (MODIFICADO) Ahora actualiza la DB cuando un mensaje pasa a 'unacked'.
+    Implementa Fair Dispatch.
+    Llama a _save_state_to_json si es durable.
     """
+    changes_made_to_durable = False
+    
     with g_lock:
         if nombre_cola not in g_colas:
             return
         
         cola = g_colas[nombre_cola]
+        is_durable = cola.get("durable", False)
         
         while cola["mensajes"] and cola["consumidores"]:
-            # ... (Lógica de Fair Dispatch idéntica para encontrar consumidor) ...
+            
+            # --- Lógica de Fair Dispatch: Buscar consumidor libre ---
             consumidores_lista = list(cola["consumidores"].items())
-            if not consumidores_lista: break
+            if not consumidores_lista:
+                break # No hay consumidores
+                
             start_index = cola["indice_rr"] % len(consumidores_lista)
+            
             consumidor_disponible = None
             indice_encontrado = -1
+
             for i in range(len(consumidores_lista)):
                 idx = (start_index + i) % len(consumidores_lista)
                 url, estado = consumidores_lista[idx]
+                
                 if estado["unacked_count"] < PREFETCH_COUNT:
                     consumidor_disponible = (url, estado)
                     indice_encontrado = idx
-                    break
+                    break # Encontramos uno
+            
             if not consumidor_disponible:
                 print("Broker: Todos los consumidores están ocupados. Esperando...")
-                break
+                break # <-- CLAVE DEL FAIR DISPATCH
             
+            # --- Fin de la búsqueda ---
+            
+            # 1. Actualizar el índice para la próxima búsqueda
             cola["indice_rr"] = (indice_encontrado + 1) % len(consumidores_lista)
+            
+            # 2. Mover mensaje de "mensajes" a "unacked"
             url_callback, estado_consumidor = consumidor_disponible
             mensaje_obj = cola["mensajes"].popleft()
             
             timestamp_envio = datetime.now()
             
-            # 1. Actualizar RAM
+            # 3. Actualizar RAM
             cola["unacked"][mensaje_obj["id"]] = {
                 "mensaje_obj": mensaje_obj,
                 "timestamp_envio": timestamp_envio,
                 "consumer_url": url_callback
             }
             estado_consumidor["unacked_count"] += 1
-
-            # 2. (NUEVO) Actualizar DB (solo si la cola es duradera)
-            if cola.get("durable", False):
-                with get_db_conn() as conn:
-                    conn.execute(
-                        """
-                        UPDATE messages 
-                        SET status = 'unacked', unacked_by_consumer = ?, unacked_timestamp = ?
-                        WHERE id = ?
-                        """,
-                        (url_callback, timestamp_envio, mensaje_obj["id"])
-                    )
-                    conn.commit()
             
-            # 3. Enviar
+            if is_durable:
+                changes_made_to_durable = True # Marcar para guardado
+            
+            # 4. Enviar
             threading.Thread(
                 target=enviar_mensaje_callback, 
                 args=(url_callback, mensaje_obj)
             ).start()
             print(f"Broker: Mensaje {mensaje_obj['id']} asignado a {url_callback} (unacked: {estado_consumidor['unacked_count']})")
+            
+        # 5. Guardar en JSON (solo si es necesario y está fuera del bucle)
+        if changes_made_to_durable:
+            _save_state_to_json() # g_lock ya está adquirido
 
-# --- Hilo de Limpieza (MODIFICADO) ---
+# -----------------------------------------------
+# --- Hilo de Limpieza ---
+# -----------------------------------------------
 
 def limpiar_y_reencolar():
     """
-    (MODIFICADO) Ahora actualiza la DB en timeouts y re-encolados.
+    Llama a _save_state_to_json si hay cambios.
     """
     while True:
-        time.sleep(10)
+        time.sleep(10) # Revisar cada 10 seg
+        
         ahora = datetime.now()
         colas_con_novedades = set()
+        changes_made_to_durable = False 
 
-        # (NUEVO) Hacemos todo el trabajo de DB en una sola conexión
-        # para el hilo de background.
-        with get_db_conn() as conn:
-            with g_lock: # Bloqueamos el estado en RAM
-                for nombre_cola, cola in list(g_colas.items()):
-                    
-                    is_durable = cola.get("durable", False)
+        with g_lock:
+            for nombre_cola, cola in list(g_colas.items()):
+                is_durable = cola.get("durable", False)
 
-                    # --- Tarea 1: Limpiar mensajes viejos (5 min) ---
-                    if not cola["consumidores"]:
-                        mensajes_activos = deque()
-                        while cola["mensajes"]:
-                            mensaje_obj = cola["mensajes"].popleft()
-                            if ahora - mensaje_obj["timestamp"] < timedelta(minutes=5):
-                                mensajes_activos.append(mensaje_obj)
-                            else:
-                                print(f"Broker: Mensaje {mensaje_obj['id']} eliminado de {nombre_cola} por caducidad (5 min).")
-                                # (NUEVO) Borrar de DB
-                                if is_durable:
-                                    conn.execute("DELETE FROM messages WHERE id = ?", (mensaje_obj["id"],))
-                        cola["mensajes"] = mensajes_activos
-
-                    # --- Tarea 2: Re-encolar 'unacked' vencidos ---
-                    mensajes_a_reencolar_ids = []
-                    for msg_id, unacked_data in list(cola["unacked"].items()):
-                        if ahora - unacked_data["timestamp_envio"] > timedelta(seconds=ACK_TIMEOUT_SEC):
-                            
-                            consumer_url = unacked_data["consumer_url"]
-                            mensaje_obj = unacked_data["mensaje_obj"]
-                            
-                            print(f"Broker: TIMEOUT en ACK para {msg_id}. Re-encolando.")
-                            
-                            # Actualizar RAM
-                            cola["mensajes"].appendleft(mensaje_obj)
-                            if consumer_url in cola["consumidores"]:
-                                cola["consumidores"][consumer_url]["unacked_count"] -= 1
-
-                            # (NUEVO) Actualizar DB
+                # --- Tarea 1: Limpiar mensajes viejos (5 min) ---
+                if not cola["consumidores"]:
+                    mensajes_activos = deque()
+                    while cola["mensajes"]:
+                        mensaje_obj = cola["mensajes"].popleft()
+                        if ahora - mensaje_obj["timestamp"] < timedelta(minutes=5):
+                            mensajes_activos.append(mensaje_obj)
+                        else:
+                            print(f"Broker: Mensaje {mensaje_obj['id']} eliminado de {nombre_cola} por caducidad (5 min).")
                             if is_durable:
-                                conn.execute(
-                                    """
-                                    UPDATE messages 
-                                    SET status = 'queued', unacked_by_consumer = NULL, unacked_timestamp = NULL
-                                    WHERE id = ?
-                                    """,
-                                    (msg_id,)
-                                )
-                            
-                            mensajes_a_reencolar_ids.append(msg_id)
-                    
-                    for msg_id in mensajes_a_reencolar_ids:
-                        del cola["unacked"][msg_id]
+                                changes_made_to_durable = True
+                    cola["mensajes"] = mensajes_activos
+
+                # --- Tarea 2: Re-encolar 'unacked' vencidos ---
+                for msg_id, unacked_data in list(cola["unacked"].items()):
+                    if ahora - unacked_data["timestamp_envio"] > timedelta(seconds=ACK_TIMEOUT_SEC):
+                        
+                        consumer_url = unacked_data["consumer_url"]
+                        mensaje_obj = unacked_data["mensaje_obj"]
+                        
+                        print(f"Broker: TIMEOUT en ACK para {msg_id}. Re-encolando.")
+                        
+                        # Actualizar RAM
+                        cola["mensajes"].appendleft(mensaje_obj)
+                        if consumer_url in cola["consumidores"]:
+                            cola["consumidores"][consumer_url]["unacked_count"] -= 1
+                        
+                        del cola["unacked"][msg_id] # Borrar de unacked
+                        
+                        if is_durable:
+                            changes_made_to_durable = True
+                        
                         colas_con_novedades.add(nombre_cola)
             
-            # (NUEVO) Hacemos commit de todos los cambios del hilo al final
-            conn.commit()
+            # Guardar en JSON (solo si hubo cambios)
+            if changes_made_to_durable:
+                _save_state_to_json() # g_lock ya está adquirido
 
         # --- Fuera del Lock, intentamos entregar ---
         for nombre_cola in colas_con_novedades:
             intentar_entrega(nombre_cola)
 
 # -----------------------------------------------
-# --- Endpoints de la API del Broker (MODIFICADOS) ---
+# --- Endpoints de la API del Broker ---
 # -----------------------------------------------
 
 @app.route('/declarar_cola', methods=['POST'])
 def declarar_cola():
     """
-    (MODIFICADO) Acepta 'durable' y lo guarda en DB.
+    Acepta 'durable' y lo guarda en JSON.
     """
     data = request.json
     nombre_cola = data.get('nombre')
-    durable = bool(data.get('durable', False)) # <-- NUEVO
+    durable = bool(data.get('durable', False)) 
     
     if not nombre_cola:
         return jsonify({"error": "Falta 'nombre'"}), 400
@@ -288,15 +356,11 @@ def declarar_cola():
                 "consumidores": {},
                 "indice_rr": 0,
                 "unacked": {},
-                "durable": durable # <-- NUEVO
+                "durable": durable
             }
-            
-            # 2. (NUEVO) Actualizar DB
+            # 2. Actualizar JSON
             if durable:
-                with get_db_conn() as conn:
-                    # INSERT OR IGNORE para idempotencia
-                    conn.execute("INSERT OR IGNORE INTO queues (name, durable) VALUES (?, 1)", (nombre_cola,))
-                    conn.commit()
+                _save_state_to_json() # g_lock ya está adquirido
             print(f"Broker: Cola '{nombre_cola}' (Durable: {durable}) creada.")
         else:
             print(f"Broker: Cola '{nombre_cola}' ya existe (idempotente).")
@@ -306,15 +370,17 @@ def declarar_cola():
 @app.route('/publicar', methods=['POST'])
 def publicar():
     """
-    (MODIFICADO) Acepta 'durable' y lo guarda en DB.
+    Acepta 'durable' y lo guarda en JSON.
     """
     data = request.json
     nombre_cola = data.get('nombre')
     mensaje = data.get('mensaje')
-    durable = bool(data.get('durable', False)) # <-- NUEVO
+    durable = bool(data.get('durable', False))
     
     if not nombre_cola or mensaje is None:
         return jsonify({"error": "Faltan 'nombre' o 'mensaje'"}), 400
+    
+    is_msg_durable = False
     
     with g_lock:
         if nombre_cola not in g_colas:
@@ -324,37 +390,31 @@ def publicar():
         cola = g_colas[nombre_cola]
         is_queue_durable = cola.get("durable", False)
         
-        mensaje_obj = {
+        # Creamos el objeto mensaje para RAM (con datetime)
+        mensaje_obj_ram = {
             "id": str(uuid.uuid4()),
             "payload": mensaje,
-            "timestamp": datetime.now()
+            "timestamp": datetime.now() # <-- Objeto datetime para RAM
         }
         
         # 1. Actualizar RAM
-        cola["mensajes"].append(mensaje_obj)
+        cola["mensajes"].append(mensaje_obj_ram)
         
-        # 2. (NUEVO) Actualizar DB
-        # Un mensaje solo es duradero si ÉL es durable Y la cola es durable
+        # 2. Actualizar JSON
         is_msg_durable = durable and is_queue_durable
         if is_msg_durable:
-            with get_db_conn() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO messages (id, queue_name, payload, timestamp, durable, status) 
-                    VALUES (?, ?, ?, ?, 1, 'queued')
-                    """,
-                    (mensaje_obj["id"], nombre_cola, mensaje_obj["payload"], mensaje_obj["timestamp"])
-                )
-                conn.commit()
+            # _save_state_to_json() se encargará de convertir
+            # el datetime a string al guardar.
+            _save_state_to_json() # g_lock ya está adquirido
 
-        print(f"Broker: Mensaje {mensaje_obj['id']} (Durable: {is_msg_durable}) recibido para '{nombre_cola}'")
+        print(f"Broker: Mensaje {mensaje_obj_ram['id']} (Durable: {is_msg_durable}) recibido para '{nombre_cola}'")
     
     intentar_entrega(nombre_cola)
     return jsonify({"status": "mensaje publicado"}), 200
 
 @app.route('/consumir', methods=['POST'])
 def consumir():
-    # (Sin cambios de lógica, solo la estructura de datos que ya teníamos)
+    # (Sin cambios de lógica)
     data = request.json
     nombre_cola = data.get('nombre')
     url_callback = data.get('callback_url')
@@ -378,7 +438,7 @@ def consumir():
 @app.route('/ack', methods=['POST'])
 def ack_mensaje():
     """
-    (MODIFICADO) Ahora borra el mensaje de la DB.
+    Ahora borra el mensaje del estado y guarda en JSON.
     """
     data = request.json
     message_id = data.get('message_id')
@@ -388,6 +448,7 @@ def ack_mensaje():
         return jsonify({"error": "Faltan 'message_id' o 'nombre_cola'"}), 400
 
     ack_exitoso = False
+    changes_made_to_durable = False
     
     with g_lock:
         if nombre_cola in g_colas:
@@ -400,38 +461,44 @@ def ack_mensaje():
             if mensaje_ackeado:
                 print(f"Broker: ACK recibido para {message_id} en {nombre_cola}.")
                 ack_exitoso = True
+                if is_durable:
+                    changes_made_to_durable = True
                 
                 consumer_url = mensaje_ackeado["consumer_url"]
                 if consumer_url in cola["consumidores"]:
                     cola["consumidores"][consumer_url]["unacked_count"] -= 1
-
-                # 2. (NUEVO) Actualizar DB
-                if is_durable:
-                    with get_db_conn() as conn:
-                        conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
-                        conn.commit()
+                else:
+                    print(f"Broker: Consumidor {consumer_url} que envió ACK ya no está suscrito.")
             else:
                 print(f"Broker: ACK recibido para {message_id} (pero no estaba en 'unacked').")
                 
+            # 2. Actualizar JSON
+            if changes_made_to_durable:
+                _save_state_to_json() # g_lock ya está adquirido
+                
     if ack_exitoso:
+        # Como este consumidor acaba de quedar libre,
+        # intentamos entregarle un nuevo mensaje INMEDIATAMENTE.
         intentar_entrega(nombre_cola)
         return jsonify({"status": "ack recibido"}), 200
     else:
         return jsonify({"status": "ack no válido o duplicado"}), 404
 
-# --- Endpoints de Administración (MODIFICADOS) ---
+# -----------------------------------------------
+# --- Endpoints de Administración ---
+# -----------------------------------------------
 
 @app.route('/colas', methods=['GET'])
 def listar_colas():
-    # (Sin cambios)
     with g_lock:
         nombres_colas = list(g_colas.keys())
+    print(f"Admin: Solicitud de listar colas. Total: {len(nombres_colas)}")
     return jsonify({"colas": nombres_colas}), 200
 
 @app.route('/colas/<string:nombre_cola>', methods=['DELETE'])
 def borrar_cola(nombre_cola):
     """
-    (MODIFICADO) Borra la cola de la DB.
+    Borra la cola de la RAM y guarda el estado en JSON.
     """
     print(f"Admin: Solicitud de borrado para cola: '{nombre_cola}'")
     
@@ -439,32 +506,26 @@ def borrar_cola(nombre_cola):
         # 1. Borrar de RAM
         cola_eliminada = g_colas.pop(nombre_cola, None)
     
-    if cola_eliminada:
-        # 2. (NUEVO) Borrar de DB
-        if cola_eliminada.get("durable", False):
-            with get_db_conn() as conn:
-                # El "ON DELETE CASCADE" debería borrar los mensajes,
-                # pero lo hacemos explícito por si acaso.
-                conn.execute("DELETE FROM messages WHERE queue_name = ?", (nombre_cola,))
-                conn.execute("DELETE FROM queues WHERE name = ?", (nombre_cola,))
-                conn.commit()
-        
-        print(f"Admin: Cola '{nombre_cola}' eliminada exitosamente.")
-        return jsonify({"status": "cola eliminada", "cola": nombre_cola}), 200
-    else:
-        print(f"Admin: Intento de borrar cola inexistente '{nombre_cola}'.")
-        return jsonify({"error": "cola no encontrada"}), 404
+        if cola_eliminada:
+            # 2. Borrar de JSON (guardando el nuevo estado sin la cola)
+            if cola_eliminada.get("durable", False):
+                _save_state_to_json() # g_lock ya está adquirido
+            
+            print(f"Admin: Cola '{nombre_cola}' eliminada exitosamente.")
+            return jsonify({"status": "cola eliminada", "cola": nombre_cola}), 200
+        else:
+            print(f"Admin: Intento de borrar cola inexistente '{nombre_cola}'.")
+            return jsonify({"error": "cola no encontrada"}), 404
 
 # -----------------------------------------------
-# --- Arranque del Servidor (MODIFICADO) ---
+# --- Arranque del Servidor ---
 # -----------------------------------------------
 if __name__ == '__main__':
-    # (NUEVO) Inicializar y cargar DB ANTES de arrancar
-    init_db()
-    load_state_from_db()
+    # Cargar estado desde JSON ANTES de arrancar
+    load_state_from_json()
     
     hilo_limpieza = threading.Thread(target=limpiar_y_reencolar, daemon=True)
     hilo_limpieza.start()
     
-    print("Broker iniciado en http://localhost:5000")
+    print(f"Broker iniciado en http://localhost:5000 (DB: {JSON_DB_FILE})")
     app.run(port=5000, debug=True, use_reloader=False)
