@@ -1,38 +1,38 @@
-import requests, threading, time, random
+import requests, threading, time, random, psutil, socket
 from flask import Flask, request, jsonify
 
-# --- Configuración del Consumidor ---
-BROKER_URL = "http://10.1.66.41:5000"
 
-MI_PUERTO = 5001
-MI_URL_CALLBACK = f"http://localhost:{MI_PUERTO}/callback"
-
-
-# --- Parte Servidor (sin cambios) ---
 app_consumidor = Flask(__name__)
 
 def procesar_mensaje_y_enviar_ack(message_id, mensaje):
-    """Simula el procesamiento del mensaje y envía el ACK al broker."""
+    """
+    Procesamos el mensaje y envía el ACK al broker.
+    """
     try:
-        print(f"CONSUMIDOR ({MI_PUERTO}): --> RECIBIDO: '{mensaje}' (ID: {message_id}). Procesando...")
+        print(f"Mensaje recibido: '{mensaje}' (ID: {message_id}). Procesando...")
         time.sleep(2)
         
-        if random.random() < 0.3:
-            print(f"CONSUMIDOR ({MI_PUERTO}): X-- FALLO SIMULADO para {message_id}. No se enviará ACK.")
-            return 
+        # Aqui podemos simular un fallo en el envío del ACK.
+        # if random.random() < 0.3:
+        #     print(f"FALLO SIMULADO para {message_id}. No se enviará ACK.")
+        #     return 
 
-        print(f"CONSUMIDOR ({MI_PUERTO}): <-- Procesado OK. Enviando ACK para {message_id}.")
+        # Envíamos el ACK al broker.
+        print(f"Enviando ACK para {message_id}.")
         requests.post(
             f"{BROKER_URL}/ack",
             json={"message_id": message_id, "nombre_cola": nombre_cola},
             timeout=2
         )
     except Exception as e:
-        print(f"CONSUMIDOR ({MI_PUERTO}): Error: {e}")
+        print(f"Error: {e}")
+
 
 @app_consumidor.route('/callback', methods=['POST'])
 def recibir_mensaje():
-    # (Sin cambios)
+    """
+    Recibimos los mensajes enviados por el broker.
+    """
     data = request.json
     mensaje = data.get('mensaje')
     message_id = data.get('message_id')
@@ -48,40 +48,61 @@ def recibir_mensaje():
     return jsonify({"status": "ok, mensaje recibido y procesando"}), 200
 
 def iniciar_servidor_consumidor():
-    print(f"\nConsumidor: Escuchando callbacks en {MI_URL_CALLBACK}")
-    app_consumidor.run(port=MI_PUERTO)
+    print(f"\nEscuchando callbacks en {CALLBACK_URL}")
+    app_consumidor.run(host=dir,port=PUERTO)
 
 def suscribirse_al_broker():
-    # Declarar la cola
-    try:
+    """
+    Nos suscribimos a la cola deseada en el broker.
+    """
+    
+    # Por si acaso no existe la cola, creamos una que sea duradera por defecto.
+    try:        
         requests.post(
             f"{BROKER_URL}/declarar_cola", 
             json={"nombre": nombre_cola, "durable": True} # <-- NUEVO
         )
-        print(f"Consumidor: Cola '{nombre_cola}' declarada (Durable: True).")
+        print(f"\nCola '{nombre_cola}' declarada (Durable: True).")
     except requests.exceptions.RequestException as e:
-        print(f"Consumidor: No se pudo conectar al broker para declarar: {e}")
+        print(f"No se pudo conectar al broker para declarar: {e}")
         return
 
-    # Suscribirse (sin cambios)
+    # Nos suscribimos a la cola.
     try:
         r = requests.post(
             f"{BROKER_URL}/consumir", 
-            json={"nombre": nombre_cola, "callback_url": MI_URL_CALLBACK}
+            json={"nombre": nombre_cola, "callback_url": CALLBACK_URL}
         )
         r.raise_for_status()
-        print(f"Consumidor: Suscrito a '{nombre_cola}' con callback {MI_URL_CALLBACK}")
+        print(f"Suscrito a '{nombre_cola}' con callback {CALLBACK_URL}")
     except requests.exceptions.RequestException as e:
-        print(f"Consumidor: Error al suscribirse: {e}")
+        print(f"Error al suscribirse: {e}")
 
 if __name__ == '__main__':
+
+    print("\nBienvenido al Consumidor.\n")
+
+    ip = input("Introduce la IP del broker: ").strip()
+    BROKER_URL = "http://" + ip + ":5000"
+
+    # Softcodeamos la IP local del broker.
+    for iface_name, iface_addrs in psutil.net_if_addrs().items():
+        if 'wi-fi' in iface_name.lower():
+            for addr in iface_addrs:
+                if addr.family == socket.AF_INET:
+                    dir = addr.address
+    
+    PUERTO = input("\nIntroduce el puerto del consumidor: ").strip()
+    CALLBACK_URL = f"http://{dir}:{PUERTO}/callback"
+
+    nombre_cola = input("\nIntroduce el nombre de la cola a consumir: ").strip()
+
     servidor_thread = threading.Thread(target=iniciar_servidor_consumidor, daemon=True)
     servidor_thread.start()
     time.sleep(1) 
-    nombre_cola = input("Consumidor: Introduce el nombre de la cola a consumir: ").strip()
     suscribirse_al_broker()
     print("Consumidor iniciado. Presiona CTRL+C para parar.")
     try:
         while True: time.sleep(10)
     except KeyboardInterrupt:
-        print("\nConsumidor: Detenido.")
+        print("\nDetenido.")

@@ -1,8 +1,9 @@
 import requests, time
 
 def declarar_cola(nombre_cola, durable):
-        
-    # Declarar la cola
+    """
+    Declara una cola en el broker con la opción de durabilidad.
+    """
     try:
         r = requests.post(
             f"{BROKER_URL}/declarar_cola", 
@@ -11,12 +12,12 @@ def declarar_cola(nombre_cola, durable):
         r.raise_for_status()
         print(f"Cola '{nombre_cola}' declarada (Durable: {durable}).")
     except requests.exceptions.RequestException as e:
-        print(f"Productor: Error al declarar cola: {e}")
-        exit(1)
+        print(f"Error al declarar cola: {e}")
 
 def enviar_mensajes(nombre_cola, durable, numero):
-
-    # Enviar mensajes
+    """
+    Envía una número de mensajes a la cola, con opción de durabilidad.
+    """
     i = 0
     while i < numero:
         try:
@@ -38,21 +39,21 @@ def enviar_mensajes(nombre_cola, durable, numero):
             
         except requests.exceptions.RequestException as e:
             print(f"Error al publicar: {e}")
+            i += 1
             time.sleep(5)
         except KeyboardInterrupt:
-            print("\nProductor: Detenido.")
+            print("\nDetenido.")
             break
 
 if __name__ == '__main__':
-
-    # ip = input("Introduce la IP del broker: ")
-    # puerto = input("Introduce el puerto del broker: ")
-    # BROKER_URL = "http://" + ip + ":" + puerto   
-    BROKER_URL = "http://localhost:5000" 
-
+    
     print("\nBienvenido al Productor.\n")
+    ip = input("Introduce la IP del broker: ").strip()
+    BROKER_URL = "http://" + ip + ":5000"
+
+    
     opcion = "0"
-    while opcion not in ["1", "2", "3", "4", "5"]:
+    while opcion != "5":
 
         print("Opciones:\n")
         print("     1. Declarar cola duradera.")
